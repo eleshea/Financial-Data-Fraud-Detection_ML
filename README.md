@@ -1,4 +1,4 @@
-##Summary
+## Summary
 1. Donwload dataset and copy to cloud storage
 2. Load and Explore the dataset
 3. Train unsupersived ML to detect abnormalies - k- means clustering
