@@ -1,0 +1,139 @@
+# 1 - Explore Top 10 transactions by amount
+SELECT *
+FROM `finance.fraud_data`
+ORDER BY amount desc
+LIMIT 10
+
+# in 1, all transactions have a 0 balance yet they are not identified as fradulent transaction in both "isFraud" and ""isFlaggedFraud" columns.
+
+# 2- Explore the "is fraud" and "isFlaggedFraud" columns
+SELECT type, isFraud,isFlaggedFraud,count(*) as cnt
+FROM `finance.fraud_data`
+GROUP BY isFraud, isFlaggedFraud,type
+Having isFraud=1 or isFlaggedFraud = 1
+ORDER BY type
+
+# in 2, transaction type CASH_OUT and TRANSFER contains fradulent activities.
+
+#3 - Check the proportion of fraudulent activities
+SELECT type,isFraud,count(*) as cnt
+FROM `finance.fraud_data`
+WHERE type in ("CASH_OUT", "TRANSFER")
+GROUP BY type ,isFraud
+
+# from 3 , the proportion of fradulent transactions found is less than 1% of the respective type's total transactions and from 1, there are fraud casese not yet been included.
+
+# as conclusion, this dataset model requires improvement in improving accurate detection of fradulent activities.
+
+# Based on 1-3, transaction type other than TRANSFER AND CASH_OUT will be filtered out in order to improve ML and Feature detection.
+
+# 4- Create a new table extracting necessary data from original table
+CREATE OR REPLACE TABLE finance.fraud_data_sample AS
+SELECT
+      type,
+      amount,
+      nameOrig,
+      nameDest,
+      oldbalanceOrg as oldbalanceOrig,
+      newbalanceOrig,
+      oldbalanceDest,
+      newbalanceDest,
+      if(oldbalanceOrg = 0.0, 1, 0) as origzeroFlag,
+      if(newbalanceDest = 0.0, 1, 0) as destzeroFlag,
+      round((newbalanceDest-oldbalanceDest-amount)) as amountError,
+      generate_uuid() as id,
+      isFraud
+FROM finance.fraud_data
+WHERE
+      type in("CASH_OUT","TRANSFER") AND
+      (isFraud = 1 or (RAND()< 10/100))  
+
+# 5- create TEST data table
+CREATE OR REPLACE TABLE finance.fraud_data_test AS
+SELECT *
+FROM finance.fraud_data_sample
+where RAND() < 20/100
+
+#6 - Create Training data table, exclude the data extracted already for TEST data table
+CREATE OR REPLACE TABLE finance.fraud_data_model AS
+SELECT
+*
+FROM finance.fraud_data_sample  
+EXCEPT distinct select * from finance.fraud_data_test  
+
+#7-start with unsupervised k-means clusting algorithm ML, 5 Clusters
+CREATE OR REPLACE MODEL
+  finance.model_unsupervised OPTIONS(model_type='kmeans', num_clusters=5) AS
+SELECT
+  amount, oldbalanceOrig, newbalanceOrig, oldbalanceDest, newbalanceDest, type, origzeroFlag, destzeroFlag, amountError
+  FROM
+  `finance.fraud_data_model`
+
+# The Davies–Bouldin index of the model is 1.51, proceed to use the TEST data to see how each cluster predict.
+
+# 8 - query the model using the Test data
+SELECT
+  centroid_id, sum(isfraud) as fraud_cnt,  count(*) total_cnt
+FROM
+  ML.PREDICT(MODEL `finance.model_unsupervised`,
+    (
+    SELECT *
+    FROM  `finance.fraud_data_test`))
+group by centroid_id
+order by centroid_id
+
+# 9 - Supervised binary logistic regression for classification of fradulent transaction
+CREATE OR REPLACE MODEL
+  finance.model_supervised_initial
+  OPTIONS(model_type='LOGISTIC_REG', INPUT_LABEL_COLS = ["isfraud"]
+  )
+AS
+SELECT
+type, amount, oldbalanceOrig, newbalanceOrig, oldbalanceDest, newbalanceDest, isFraud
+FROM finance.fraud_data_model
+
+#10 - check importance of each feature 
+SELECT
+  *
+FROM
+  ML.WEIGHTS(MODEL `finance.model_supervised_initial`,
+    STRUCT(true AS standardize))
+
+# 11 - Create a new gradient boost model and train the two models to get better accuracy  
+CREATE OR REPLACE MODEL
+finance.model_supervised_boosted_tree
+OPTIONS(model_type='BOOSTED_TREE_CLASSIFIER', INPUT_LABEL_COLS = ["isfraud"]
+)
+AS
+SELECT
+type, amount, oldbalanceOrig, newbalanceOrig, oldbalanceDest, newbalanceDest, isFraud
+FROM finance.fraud_data_model
+
+#12 - Improve BOTH supervised model
+CREATE OR REPLACE TABLE finance.table_perf AS
+SELECT "Initial_reg" as model_name, *
+FROM ML.EVALUATE(MODEL `finance.model_supervised_initial`, (
+SELECT *
+FROM `finance.fraud_data_model` ))
+
+insert finance.table_perf
+SELECT "improved_reg" as model_name, *
+FROM  ML.EVALUATE(MODEL `finance.model_supervised_boosted_tree`, (
+SELECT *
+FROM  `finance.fraud_data_model` ))
+
+# from 12, Boosted Tree model performs better, adding new features also improves performance
+
+
+# 13- Using the boosted tree model to predict the fraudulent transaction
+SELECT id, label as predicted, isFraud as actual
+FROM
+  ML.PREDICT(MODEL `finance.model_supervised_boosted_tree`,
+   (
+    SELECT  *
+    FROM  `finance.fraud_data_test`
+   )
+  ), unnest(predicted_isfraud_probs) as p
+where p.label = 1 and p.prob > 0.5
+
+#The event rate has increased significantly.
